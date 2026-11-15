@@ -1,0 +1,5 @@
+{
+  "domains": ["https://tim-streams.com"],
+  "eventTimezone": "America/New_York",
+  "note": "Edit this file from your phone when the site moves. The plugin and the daily bot both read it."
+}
