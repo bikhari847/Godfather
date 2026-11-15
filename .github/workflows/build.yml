@@ -1,0 +1,56 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "config.json"
+      - "**.md"
+      - "scripts/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Point the plugin at this repo
+        run: |
+          BRANCH="${{ github.event.repository.default_branch }}"
+          sed -i "s#YOUR_GITHUB_REPO/main#${GITHUB_REPOSITORY}/${BRANCH}#" TimStreams/src/main/kotlin/com/timstreams/TimStreamsProvider.kt
+          sed -i "s#YOUR_GITHUB_REPO#${GITHUB_REPOSITORY}#" repo.json
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Build
+        run: gradle make makePluginsJson --stacktrace
+
+      - name: Publish to builds branch
+        run: |
+          mkdir -p /tmp/out
+          find . -name "*.cs3" -path "*/build/*" -exec cp {} /tmp/out/ \;
+          cp build/plugins.json /tmp/out/
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan builds-new
+          git rm -rf . -q || true
+          git clean -fdxq
+          cp /tmp/out/* .
+          git add .
+          git commit -m "Build ${GITHUB_SHA::7}"
+          git push -f origin HEAD:builds
