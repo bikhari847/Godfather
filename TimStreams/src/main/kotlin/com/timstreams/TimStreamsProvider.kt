@@ -1,6 +1,6 @@
 package com.timstreams
 
-import android.util.Base64
+import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
@@ -16,12 +16,14 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
 
+private const val TAG = "TimStreams"
 private const val CONFIG_URL = "https://raw.githubusercontent.com/YOUR_GITHUB_REPO/main/config.json"
 private val DEFAULT_DOMAINS = listOf("https://tim-streams.com")
 private const val USER_AGENT =
@@ -52,11 +54,6 @@ data class ItemDto(
     val streams: List<StreamDto>? = null,
 )
 
-data class ItemsResponse(
-    val events: List<ItemDto>? = null,
-    val channels: List<ItemDto>? = null,
-)
-
 data class ConfigDto(
     val domains: List<String>? = null,
     @JsonProperty("eventTimezone") val eventTimezone: String? = null,
@@ -74,6 +71,9 @@ private data class Resolved(
     val headers: Map<String, String>,
     val expiresAt: Long,
 )
+
+private fun JSONObject.str(key: String): String? =
+    if (isNull(key)) null else optString(key, "").trim().ifBlank { null }
 
 class TimStreamsProvider : MainAPI() {
     override var name = "TimStreams"
@@ -155,11 +155,46 @@ class TimStreamsProvider : MainAPI() {
         return current ?: candidates.firstOrNull() ?: DEFAULT_DOMAINS.first()
     }
 
+    // Reads each item on its own, so one odd entry can never empty the whole list.
+    private fun parseItems(text: String, key: String): List<ItemDto>? {
+        val root = runCatching { JSONObject(text) }.getOrNull() ?: return null
+        if (!root.has(key)) return null
+        val arr = root.optJSONArray(key) ?: return emptyList()
+        val out = ArrayList<ItemDto>()
+        for (i in 0 until arr.length()) {
+            runCatching {
+                val o = arr.getJSONObject(i)
+                val streams = ArrayList<StreamDto>()
+                o.optJSONArray("streams")?.let { sa ->
+                    for (j in 0 until sa.length()) {
+                        runCatching {
+                            val s = sa.getJSONObject(j)
+                            streams.add(StreamDto(s.str("name"), s.str("url"), s.optBoolean("vip", false)))
+                        }
+                    }
+                }
+                out.add(
+                    ItemDto(
+                        url = o.str("url"),
+                        name = o.str("name"),
+                        logo = o.str("logo"),
+                        genre = if (o.isNull("genre")) null else o.optInt("genre", -1).takeIf { it >= 0 },
+                        time = o.str("time"),
+                        vip = o.optBoolean("vip", false),
+                        streams = streams,
+                    )
+                )
+            }
+        }
+        return out
+    }
+
     private suspend fun fetchItems(kind: String, base: String): List<ItemDto>? = runCatching {
         val path = if (kind == KIND_EVENTS) "/api/live-upcoming" else "/api/channels"
         val text = app.get(base + path, headers = apiHeaders(base), timeout = 20L).text
-        val parsed = tryParseJson<ItemsResponse>(text)
-        if (kind == KIND_EVENTS) parsed?.events else parsed?.channels
+        val items = parseItems(text, kind)
+        Log.i(TAG, "fetch $kind: items=${items?.size} chars=${text.length} head=${text.take(120)}")
+        items
     }.getOrNull()
 
     private suspend fun getItems(kind: String): List<ItemDto> {
@@ -303,7 +338,7 @@ class TimStreamsProvider : MainAPI() {
         val segment = if (kind == KIND_EVENTS) "event" else "channel"
         val pageUrl = "$base/$segment/$slug"
 
-        // Warm up: start resolving the first stream while the user is still looking at this page
+        // Warm up: resolve the first stream while the user is still on this page
         free.firstOrNull()?.url?.let { first ->
             CoroutineScope(Dispatchers.IO).launch {
                 runCatching { resolveStream(first, pageUrl, mutableListOf()) }
@@ -321,7 +356,6 @@ class TimStreamsProvider : MainAPI() {
     // -----------------------------------------------------------------------
     private val m3u8InText = Regex("""https?://[^"'\s<>\\]+?\.m3u8[^"'\s<>\\]*""")
     private val m3u8InUrl = Regex("""\.m3u8""")
-    private val pathP = Regex("""(https?://[^"'\s<>]+?)?/p/([0-9a-f]{32})""")
     private val expiryRegex = Regex("""/(\d{10})/[^/]+$""")
 
     private fun originOf(url: String): String =
@@ -336,7 +370,6 @@ class TimStreamsProvider : MainAPI() {
         return h
     }
 
-    /** The playlist address contains its expiry time as a 10-digit number. Cache until shortly before. */
     private fun expiryOf(url: String): Long {
         val now = System.currentTimeMillis()
         val ts = expiryRegex.find(url.substringBefore("?"))?.groupValues?.get(1)?.toLongOrNull()
@@ -345,51 +378,18 @@ class TimStreamsProvider : MainAPI() {
         return if (exp > now + 30_000L) minOf(exp, now + LINK_TTL_MAX) else now + LINK_TTL_DEFAULT
     }
 
-    private fun decodeMaybe(raw: String): String? {
-        m3u8InText.find(raw)?.let { return it.value }
-        val decoded = runCatching {
-            String(Base64.decode(raw.trim(), Base64.DEFAULT), Charsets.UTF_8)
-        }.getOrNull() ?: return null
-        return m3u8InText.find(decoded)?.value
-    }
-
-    /** Cheap attempts that need no WebView: playlist in the embed page, or readable /p/ reply. */
-    private suspend fun quickScan(embedUrl: String, referer: String, origin: String, trace: MutableList<String>): String? =
-        withTimeoutOrNull(7_000L) {
+    private suspend fun quickScan(embedUrl: String, referer: String, trace: MutableList<String>): String? =
+        withTimeoutOrNull(6_000L) {
             runCatching {
-                val res = app.get(
+                val text = app.get(
                     embedUrl,
                     referer = referer,
                     headers = mapOf("User-Agent" to USER_AGENT),
                     timeout = 5L
-                )
-                val text = res.text.replace("\\/", "/")
-                val direct = m3u8InText.find(text)?.value
-                if (direct != null) {
-                    trace.add("html:hit")
-                    return@runCatching direct
-                }
-                trace.add("html:none")
-
-                val m = pathP.find(text)
-                val host = m?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
-                val id = m?.groupValues?.get(2)
-                if (host == null || id == null) {
-                    trace.add("p:none")
-                    return@runCatching null
-                }
-                val body = app.get(
-                    "$host/p/$id",
-                    headers = mapOf(
-                        "Origin" to origin,
-                        "Referer" to "$origin/",
-                        "User-Agent" to USER_AGENT
-                    ),
-                    timeout = 4L
-                ).text
-                val link = decodeMaybe(body)
-                trace.add(if (link != null) "p:hit" else "p:scrambled")
-                link
+                ).text.replace("\\/", "/")
+                val hit = m3u8InText.find(text)?.value
+                trace.add(if (hit != null) "html:hit" else "html:none")
+                hit
             }.getOrNull()
         }
 
@@ -445,7 +445,7 @@ class TimStreamsProvider : MainAPI() {
         val base = baseUrl ?: mainUrl
         val origin = originOf(embedUrl)
 
-        quickScan(embedUrl, "$base/", origin, trace)?.let {
+        quickScan(embedUrl, "$base/", trace)?.let {
             val r = Resolved(it, "$origin/", buildHeaders(emptyMap(), origin), expiryOf(it))
             linkCache[embedUrl] = r
             return r
@@ -495,29 +495,52 @@ class TimStreamsProvider : MainAPI() {
             val resolved = runCatching {
                 resolveStream(stream.url!!, if (index == 0) ld?.page else null, trace)
             }.getOrNull()
+            val label = clean(stream.name) ?: "Stream"
+            Log.i(TAG, "stream '$label' trace=${trace.joinToString(" ")} url=${resolved?.url?.take(100)}")
 
             if (resolved != null) {
                 runCatching {
-                    callback(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name - ${clean(stream.name) ?: "Stream"}",
-                            url = resolved.url,
-                            type = ExtractorLinkType.M3U8
-                        ) {
-                            this.referer = resolved.referer
-                            this.headers = resolved.headers
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
-                    found = true
+                    val proxyHeaders = resolved.headers.filterKeys {
+                        it.equals("Origin", true) || it.equals("User-Agent", true)
+                    }
+                    val proxied = TimProxy.wrap(resolved.url, proxyHeaders)
+                    if (proxied != null) {
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name - $label",
+                                url = proxied,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = ""
+                                this.headers = emptyMap()
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        found = true
+                    }
+                    if (proxied == null || debug) {
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "$name - $label (direct)",
+                                url = resolved.url,
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.referer = resolved.referer
+                                this.headers = resolved.headers
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        found = true
+                    }
                 }
             } else if (debug) {
                 runCatching {
                     callback(
                         newExtractorLink(
                             source = name,
-                            name = "⚠ ${clean(stream.name) ?: "Stream"}: ${trace.joinToString(" ")}",
+                            name = "⚠ $label: ${trace.joinToString(" ")}",
                             url = "https://invalid.invalid/debug.m3u8",
                             type = ExtractorLinkType.M3U8
                         ) {
@@ -530,4 +553,4 @@ class TimStreamsProvider : MainAPI() {
         }
         return found
     }
-}    
+}
