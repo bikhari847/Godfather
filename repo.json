@@ -3,6 +3,6 @@
   "description": "Self-healing TimStreams provider for CloudStream",
   "manifestVersion": 1,
   "pluginLists": [
-    "https://raw.githubusercontent.com/YOUR_GITHUB_REPO/builds/plugins.json"
+    "https://raw.githubusercontent.com/bikhari847/Godfather/builds/plugins.json"
   ]
 }
