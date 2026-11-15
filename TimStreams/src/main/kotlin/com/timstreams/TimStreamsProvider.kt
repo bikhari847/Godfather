@@ -12,6 +12,7 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
+import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
@@ -23,9 +24,11 @@ private const val USER_AGENT =
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 private const val BASE_TTL = 10 * 60_000L
 private const val ITEMS_TTL = 30_000L
+private const val LINK_TTL = 90_000L
 private const val LIVE_WINDOW = 270 * 60_000L
 private const val KIND_EVENTS = "events"
 private const val KIND_CHANNELS = "channels"
+private val KEEP_HEADERS = setOf("origin", "referer", "user-agent", "cookie")
 
 data class StreamDto(
     val name: String? = null,
@@ -85,6 +88,7 @@ class TimStreamsProvider : MainAPI() {
     )
 
     private val cache = ConcurrentHashMap<String, Pair<Long, List<ItemDto>>>()
+    private val linkCache = ConcurrentHashMap<String, Pair<Long, Resolved>>()
     @Volatile private var baseUrl: String? = null
     @Volatile private var baseCheckedAt = 0L
     @Volatile private var eventTz = "America/New_York"
@@ -158,13 +162,17 @@ class TimStreamsProvider : MainAPI() {
         return s.ifBlank { null }
     }
 
-    private fun poster(logo: String?, base: String): String? {
+    private fun poster(logo: String?, base: String, kind: String): String? {
         val s = clean(logo) ?: return null
-        return when {
+        val abs = when {
             s.startsWith("//") -> "https:$s"
             s.startsWith("/") -> base + s
             else -> s
         }
+        // Channel logos come from many random hosts: route them through an image proxy
+        return if (kind == KIND_CHANNELS && abs.startsWith("http") && !abs.startsWith(base)) {
+            "https://wsrv.nl/?url=" + URLEncoder.encode(abs, "UTF-8") + "&w=500&output=png"
+        } else abs
     }
 
     private fun ItemDto.startMillis(): Long? {
@@ -202,7 +210,7 @@ class TimStreamsProvider : MainAPI() {
             "$base/$segment/$slug",
             TvType.Live
         ) {
-            this.posterUrl = poster(logo, base)
+            this.posterUrl = poster(logo, base, kind)
         }
     }
 
@@ -270,51 +278,103 @@ class TimStreamsProvider : MainAPI() {
         }
 
         return newLiveStreamLoadResponse(title, url, free.toJson()) {
-            this.posterUrl = poster(item.logo, base)
+            this.posterUrl = poster(item.logo, base, kind)
             this.plot = plot
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Stream resolving
+    // -----------------------------------------------------------------------
     private val m3u8InText = Regex("""https?://[^"'\s<>\\]+?\.m3u8[^"'\s<>\\]*""")
     private val m3u8InUrl = Regex("""\.m3u8""")
 
     private fun originOf(url: String): String =
         Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1) ?: url
 
-    private suspend fun findInHtml(embedUrl: String, referer: String): String? = runCatching {
-        val text = app.get(
-            embedUrl,
-            referer = referer,
-            headers = mapOf("User-Agent" to USER_AGENT),
-            timeout = 12L
-        ).text.replace("\\/", "/")
-        m3u8InText.find(text)?.value
-    }.getOrNull()
+    private fun buildHeaders(captured: Map<String, String>, origin: String): Map<String, String> {
+        val h = LinkedHashMap<String, String>()
+        captured.forEach { (k, v) -> if (k.lowercase() in KEEP_HEADERS) h[k] = v }
+        if (h.keys.none { it.equals("Origin", true) }) h["Origin"] = origin
+        if (h.keys.none { it.equals("Referer", true) }) h["Referer"] = "$origin/"
+        if (h.keys.none { it.equals("User-Agent", true) }) h["User-Agent"] = USER_AGENT
+        return h
+    }
 
-    private suspend fun findWithWebView(embedUrl: String, referer: String): String? =
-        webViewLock.withLock {
-            withTimeoutOrNull(25_000L) {
-                runCatching {
-                    val res = app.get(
-                        embedUrl,
-                        referer = referer,
-                        interceptor = WebViewResolver(m3u8InUrl)
-                    )
-                    res.url.takeIf { m3u8InUrl.containsMatchIn(it) }
-                }.getOrNull()
-            }
+    /** Quick attempt: sometimes the playlist URL is right in the embed page. */
+    private suspend fun findInHtml(embedUrl: String, referer: String): String? =
+        withTimeoutOrNull(4_000L) {
+            runCatching {
+                app.get(
+                    embedUrl,
+                    referer = referer,
+                    headers = mapOf("User-Agent" to USER_AGENT),
+                    timeout = 4L
+                ).text.replace("\\/", "/").let { m3u8InText.find(it)?.value }
+            }.getOrNull()
         }
 
+    /** Loads a page in a hidden WebView and catches the first .m3u8 request it makes. */
+    private suspend fun sniff(
+        pageUrl: String,
+        referer: String,
+        script: String?
+    ): Pair<String, Map<String, String>>? =
+        withTimeoutOrNull(22_000L) {
+            runCatching {
+                val resolver = WebViewResolver(
+                    interceptUrl = m3u8InUrl,
+                    useOkhttp = false,
+                    script = script
+                )
+                val (req, _) = resolver.resolveUsingWebView(pageUrl, referer)
+                req?.let { it.url.toString() to it.headers.toMap() }
+            }.getOrNull()
+        }
+
+    private fun injectScript(embedUrl: String): String {
+        val safe = embedUrl.replace("\\", "\\\\").replace("'", "\\'")
+        return """
+            (function(){
+              try {
+                document.documentElement.innerHTML = '<head></head><body style="margin:0;background:#000"></body>';
+                var f = document.createElement('iframe');
+                f.src = '$safe';
+                f.allow = 'autoplay; encrypted-media; fullscreen';
+                f.setAttribute('allowfullscreen', 'true');
+                f.style.cssText = 'border:0;width:100vw;height:100vh';
+                document.body.appendChild(f);
+              } catch (e) {}
+            })();
+        """.trimIndent()
+    }
+
     private suspend fun resolveStream(embedUrl: String): Resolved? {
+        val now = System.currentTimeMillis()
+        linkCache[embedUrl]?.let { if (now - it.first < LINK_TTL) return it.second }
+
         val base = baseUrl ?: mainUrl
         val origin = originOf(embedUrl)
-        val headers = mapOf(
-            "Origin" to origin,
-            "Referer" to "$origin/",
-            "User-Agent" to USER_AGENT,
-        )
-        val link = findInHtml(embedUrl, "$base/") ?: findWithWebView(embedUrl, "$base/") ?: return null
-        return Resolved(link, "$origin/", headers)
+
+        // 1) Fast: playlist visible in the embed HTML
+        findInHtml(embedUrl, "$base/")?.let {
+            val r = Resolved(it, "$origin/", buildHeaders(emptyMap(), origin))
+            linkCache[embedUrl] = now to r
+            return r
+        }
+
+        // 2) Reliable: player inside a tim-streams.com page (like a real browser), then 3) player on its own
+        val captured = webViewLock.withLock {
+            linkCache[embedUrl]?.let { return@withLock null to it.second }
+            val hit = sniff("$base/api/settings", "$base/", injectScript(embedUrl))
+                ?: sniff(embedUrl, "$base/", null)
+            hit to null
+        }
+        captured.second?.let { return it }
+        val (url, hdrs) = captured.first ?: return null
+        val r = Resolved(url, hdrs["Referer"] ?: "$origin/", buildHeaders(hdrs, origin))
+        linkCache[embedUrl] = System.currentTimeMillis() to r
+        return r
     }
 
     override suspend fun loadLinks(
