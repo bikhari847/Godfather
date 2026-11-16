@@ -24,6 +24,7 @@ internal object TimProxy {
     @Volatile private var server: ServerSocket? = null
     @Volatile private var port = 0
     @Volatile private var segLogged = 0
+    @Volatile private var errLogged = 0
 
     private class Up(val code: Int, val body: ByteArray)
 
@@ -67,12 +68,15 @@ internal object TimProxy {
     private fun handle(sock: Socket) {
         try {
             sock.soTimeout = 30_000
+            sock.tcpNoDelay = true
             val reader = sock.getInputStream().bufferedReader(Charsets.ISO_8859_1)
             val requestLine = reader.readLine() ?: return
             while (true) {
                 val l = reader.readLine() ?: break
                 if (l.isEmpty()) break
             }
+            val method = requestLine.substringBefore(" ")
+            val head = method.equals("HEAD", true)
             val target = requestLine.split(" ").getOrNull(1) ?: return
             val path = target.substringBefore("?")
             val query = target.substringAfter("?", "")
@@ -85,14 +89,26 @@ internal object TimProxy {
             val headers = sessions[session]
             val out = sock.getOutputStream()
             if (url == null || headers == null) {
-                respond(out, 404, "text/plain", ByteArray(0))
+                respond(out, 404, "text/plain", ByteArray(0), head)
                 return
             }
 
-            val up = fetch(url, headers)
+            val up = try {
+                fetch(url, headers)
+            } catch (e: Exception) {
+                if (errLogged < 8) {
+                    errLogged++
+                    Log.w(TAG, "upstream failed for ${url.take(90)}: $e")
+                }
+                respond(out, 502, "text/plain", ByteArray(0), head)
+                return
+            }
             if (up.code !in 200..299) {
-                Log.w(TAG, "upstream ${up.code} for ${url.take(90)}")
-                respond(out, if (up.code > 0) up.code else 502, "text/plain", ByteArray(0))
+                if (errLogged < 8) {
+                    errLogged++
+                    Log.w(TAG, "upstream ${up.code} for ${url.take(90)}")
+                }
+                respond(out, if (up.code > 0) up.code else 502, "text/plain", ByteArray(0), head)
                 return
             }
 
@@ -101,15 +117,17 @@ internal object TimProxy {
                     val text = String(up.body, Charsets.UTF_8)
                     if (!text.trimStart().startsWith("#EXTM3U")) {
                         Log.w(TAG, "not a playlist: ${text.take(80)}")
+                        respond(out, 502, "text/plain", ByteArray(0), head)
+                        return
                     }
                     val body = rewrite(text, url, session).toByteArray(Charsets.UTF_8)
-                    respond(out, 200, "application/vnd.apple.mpegurl", body)
+                    respond(out, 200, "application/vnd.apple.mpegurl", body, head)
                 }
                 "s" -> {
                     val (data, type) = clean(up.body)
-                    respond(out, 200, type, data)
+                    respond(out, 200, type, data, head)
                 }
-                else -> respond(out, 200, "application/octet-stream", up.body)
+                else -> respond(out, 200, "application/octet-stream", up.body, head)
             }
         } catch (e: Exception) {
             Log.w(TAG, "proxy error: $e")
@@ -122,20 +140,29 @@ internal object TimProxy {
     }
 
     private fun fetch(url: String, headers: Map<String, String>): Up {
-        val c = URL(url).openConnection() as HttpURLConnection
-        try {
-            c.connectTimeout = 10_000
-            c.readTimeout = 20_000
-            c.instanceFollowRedirects = true
-            c.setRequestProperty("Accept", "*/*")
-            headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
-            val code = c.responseCode
-            val stream = if (code in 200..299) c.inputStream else c.errorStream
-            val bytes = stream?.use { it.readBytes() } ?: ByteArray(0)
-            return Up(code, bytes)
-        } finally {
-            c.disconnect()
+        var last: Exception? = null
+        for (attempt in 0..1) {
+            try {
+                val c = URL(url).openConnection() as HttpURLConnection
+                try {
+                    c.connectTimeout = 8_000
+                    c.readTimeout = 15_000
+                    c.instanceFollowRedirects = true
+                    c.setRequestProperty("Accept", "*/*")
+                    headers.forEach { (k, v) -> c.setRequestProperty(k, v) }
+                    val code = c.responseCode
+                    val stream = if (code in 200..299) c.inputStream else c.errorStream
+                    val bytes = stream?.use { it.readBytes() } ?: ByteArray(0)
+                    if (code >= 500 && attempt == 0) continue
+                    return Up(code, bytes)
+                } finally {
+                    c.disconnect()
+                }
+            } catch (e: Exception) {
+                last = e
+            }
         }
+        throw last ?: java.io.IOException("fetch failed")
     }
 
     private fun rewrite(text: String, baseUrl: String, session: String): String {
@@ -228,23 +255,24 @@ internal object TimProxy {
                 how = "unknown(start=$start)"
             }
         }
-        if (segLogged < 6) {
+        if (segLogged < 4) {
             segLogged++
-            val head = b.take(24).joinToString("") { "%02x".format(it) }
-            Log.i(TAG, "segment size=${b.size} png=$png head=$head -> $how")
+            val headHex = b.take(24).joinToString("") { "%02x".format(it) }
+            Log.i(TAG, "segment size=${b.size} png=$png head=$headHex -> $how")
         }
         return result
     }
 
-    private fun respond(out: OutputStream, code: Int, contentType: String, body: ByteArray) {
+    private fun respond(out: OutputStream, code: Int, contentType: String, body: ByteArray, head: Boolean) {
         val reason = if (code == 200) "OK" else "Error"
-        val head = "HTTP/1.1 $code $reason\r\n" +
+        val header = "HTTP/1.1 $code $reason\r\n" +
             "Content-Type: $contentType\r\n" +
             "Content-Length: ${body.size}\r\n" +
+            "Cache-Control: no-store\r\n" +
             "Access-Control-Allow-Origin: *\r\n" +
             "Connection: close\r\n\r\n"
-        out.write(head.toByteArray(Charsets.ISO_8859_1))
-        out.write(body)
+        out.write(header.toByteArray(Charsets.ISO_8859_1))
+        if (!head) out.write(body)
         out.flush()
     }
 }
