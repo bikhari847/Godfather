@@ -3,7 +3,6 @@ package com.timstreams
 import android.util.Log
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.toJson
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -17,12 +16,14 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
-import java.net.URL
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -33,49 +34,18 @@ private const val TAG = "TimStreams"
 private const val CONFIG_URL = "https://raw.githubusercontent.com/YOUR_GITHUB_REPO/main/config.json"
 private val DEFAULT_DOMAINS = listOf("https://tim-streams.com")
 private const val USER_AGENT =
-    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 private const val BASE_TTL = 10 * 60_000L
 private const val ITEMS_TTL = 30_000L
 private const val LINK_TTL_DEFAULT = 90_000L
 private const val LINK_TTL_MAX = 60 * 60_000L
 private const val LIVE_WINDOW = 270 * 60_000L
-private const val RESOLVE_WAIT = 36_000L
+private const val RESOLVE_WAIT = 30_000L
 private const val KIND_EVENTS = "events"
 private const val KIND_CHANNELS = "channels"
 private val KEEP_HEADERS = setOf("origin", "referer", "user-agent", "cookie")
 private val GENERIC_LABELS = setOf("timstreams", "timstream", "stream", "stream 1", "default", "live", "")
-
 private val KNOWN_GENRES = setOf(1, 2, 3, 6, 7, 8, 9, 10, 11, 13, 15, 16)
-private val SPORT_ROWS = listOf(
-    Triple("events:g1", "Soccer", setOf(1)),
-    Triple("events:g2", "Motorsport", setOf(2)),
-    Triple("events:g3", "Fighting", setOf(3)),
-    Triple("events:g6", "Wrestling", setOf(6)),
-    Triple("events:g7", "Basketball", setOf(7)),
-    Triple("events:g8", "American Football", setOf(8)),
-    Triple("events:g9", "Baseball", setOf(9)),
-    Triple("events:g10", "Tennis", setOf(10)),
-    Triple("events:g11", "Hockey", setOf(11)),
-    Triple("events:g13", "Cricket", setOf(13)),
-    Triple("events:g15,16", "Rugby", setOf(15, 16)),
-)
-private val OTHER_CHANNEL_ROWS = listOf(
-    "channels:g1" to "Entertainment",
-    "channels:g3" to "Cartoons",
-    "channels:g4" to "Movies",
-    "channels:g5" to "News",
-)
-
-private fun defaultRows(): List<Pair<String, String>> {
-    val rows = ArrayList<Pair<String, String>>()
-    rows.add("events:live" to "🔴 Live Now")
-    rows.add("events:upcoming" to "Upcoming")
-    rows.add("channels:g2" to "Sports Channels")
-    SPORT_ROWS.forEach { rows.add(it.first to it.second) }
-    rows.add("events:other" to "Other Events")
-    rows.addAll(OTHER_CHANNEL_ROWS)
-    return rows
-}
 
 data class StreamDto(
     val name: String? = null,
@@ -114,8 +84,6 @@ private data class Resolved(
 
 private class Feed(val items: List<ItemDto>, val at: Long)
 
-private class Attempt(val label: String, val page: String, val script: String?, val ms: Long)
-
 private fun JSONObject.str(key: String): String? =
     if (isNull(key)) null else optString(key, "").trim().ifBlank { null }
 
@@ -126,9 +94,27 @@ class TimStreamsProvider : MainAPI() {
     override val hasMainPage = true
     override val supportedTypes = setOf(TvType.Live)
 
-    // Rows with nothing in them are hidden once the first fetch has happened
-    override val mainPage: List<MainPageData>
-        get() = runCatching { buildRows() }.getOrElse { mainPageOf(*defaultRows().toTypedArray()) }
+    override val mainPage = mainPageOf(
+        "events:live" to "🔴 Live Now",
+        "events:upcoming" to "Upcoming",
+        "channels:g2" to "Sports Channels",
+        "channels:g5" to "News",
+        "channels:g1" to "Entertainment",
+        "channels:g3" to "Cartoons",
+        "channels:g4" to "Movies",
+        "events:g1" to "Soccer",
+        "events:g2" to "Motorsport",
+        "events:g3" to "Fighting",
+        "events:g6" to "Wrestling",
+        "events:g7" to "Basketball",
+        "events:g8" to "American Football",
+        "events:g9" to "Baseball",
+        "events:g10" to "Tennis",
+        "events:g11" to "Hockey",
+        "events:g13" to "Cricket",
+        "events:g15,16" to "Rugby",
+        "events:other" to "Other Events",
+    )
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val feed = ConcurrentHashMap<String, Feed>()
@@ -137,12 +123,10 @@ class TimStreamsProvider : MainAPI() {
     private val linkCache = ConcurrentHashMap<String, Resolved>()
     private val inflight = ConcurrentHashMap<String, Deferred<Resolved?>>()
     private val wanted: MutableSet<String> = ConcurrentHashMap.newKeySet()
-    @Volatile private var latestPrewarm: String? = null
     @Volatile private var baseUrl: String? = null
     @Volatile private var baseCheckedAt = 0L
     @Volatile private var eventTz = "America/New_York"
     private val baseLock = Mutex()
-    private val webViewLock = Mutex()
 
     // -----------------------------------------------------------------------
     // Domain handling (self-healing)
@@ -315,20 +299,6 @@ class TimStreamsProvider : MainAPI() {
         return SimpleDateFormat("EEE d MMM, HH:mm", Locale.getDefault()).format(start)
     }
 
-    private fun buildRows(): List<MainPageData> {
-        val ev = feed[KIND_EVENTS]?.items
-        val rows = ArrayList<Pair<String, String>>()
-        if (ev == null || ev.any { it.isLive() }) rows.add("events:live" to "🔴 Live Now")
-        if (ev == null || ev.any { it.isUpcoming() }) rows.add("events:upcoming" to "Upcoming")
-        rows.add("channels:g2" to "Sports Channels")
-        for ((data, label, ids) in SPORT_ROWS) {
-            if (ev == null || ev.any { it.genre in ids }) rows.add(data to label)
-        }
-        if (ev == null || ev.any { it.genre !in KNOWN_GENRES }) rows.add("events:other" to "Other Events")
-        rows.addAll(OTHER_CHANNEL_ROWS)
-        return mainPageOf(*rows.toTypedArray())
-    }
-
     private fun ItemDto.toResponse(kind: String, base: String): SearchResponse? {
         val slug = url?.takeIf { it.isNotBlank() } ?: return null
         val title = clean(name) ?: return null
@@ -412,8 +382,7 @@ class TimStreamsProvider : MainAPI() {
 
         // Start finding the stream right now, so Play is (nearly) instant
         free.firstOrNull()?.url?.let { first ->
-            latestPrewarm = first
-            runCatching { launchResolve(first, pageUrl, false) }
+            runCatching { launchResolve(first, pageUrl, user = false, first = true) }
         }
 
         return newLiveStreamLoadResponse(title, url, LinkData(pageUrl, free, title).toJson()) {
@@ -430,8 +399,17 @@ class TimStreamsProvider : MainAPI() {
     // -----------------------------------------------------------------------
     // Stream resolving
     // -----------------------------------------------------------------------
-    private val m3u8InUrl = Regex("""\.m3u8""")
     private val expiryRegex = Regex("""/(\d{10})/[^/]+$""")
+    private val autoplayScript = """
+        (function(){
+          try {
+            setInterval(function(){
+              var v = document.querySelector('video');
+              if (v && v.paused) { v.muted = true; if (v.play) { v.play().catch(function(){}); } }
+            }, 800);
+          } catch (e) {}
+        })();
+    """.trimIndent()
 
     private fun originOf(url: String): String =
         Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1) ?: url
@@ -455,13 +433,13 @@ class TimStreamsProvider : MainAPI() {
 
     private fun jsEsc(s: String) = s.replace("\\", "\\\\").replace("'", "\\'")
 
-    private fun injectScript(embedUrl: String, spoofPath: String?): String {
-        val path = if (spoofPath != null) "try { history.replaceState(null, '', '${jsEsc(spoofPath)}'); } catch (e) {}" else ""
+    private fun injectScript(embedUrl: String): String {
         val src = jsEsc(embedUrl)
         return """
             (function(){
               try {
-                $path
+                if (window.__tim) { return; }
+                window.__tim = 1;
                 document.documentElement.innerHTML = '<head></head><body style="margin:0;background:#000"></body>';
                 var f = document.createElement('iframe');
                 f.src = '$src';
@@ -474,77 +452,74 @@ class TimStreamsProvider : MainAPI() {
         """.trimIndent()
     }
 
-    private suspend fun sniff(
-        pageUrl: String,
-        referer: String,
-        script: String?,
-        timeoutMs: Long
-    ): Pair<String, Map<String, String>>? =
-        withTimeoutOrNull(timeoutMs) {
-            runCatching {
-                val resolver = WebViewResolver(
-                    interceptUrl = m3u8InUrl,
-                    useOkhttp = false,
-                    script = script
-                )
-                val (req, _) = resolver.resolveUsingWebView(pageUrl, referer)
-                req?.let { it.url.toString() to it.headers.toMap() }
-            }.getOrNull()
-        }
-
     private fun cached(embedUrl: String): Resolved? {
         val r = linkCache[embedUrl] ?: return null
         return if (System.currentTimeMillis() < r.expiresAt) r else null
     }
 
-    private suspend fun doResolve(embedUrl: String, pageUrl: String?): Resolved? {
+    /** Runs several ways of loading the player at the same time; the first link wins. */
+    private suspend fun race(attempts: List<suspend () -> Sniffed?>): Sniffed? = coroutineScope {
+        val result = CompletableDeferred<Sniffed?>()
+        val jobs = attempts.map { a ->
+            launch {
+                val r = runCatching { a() }.getOrNull()
+                if (r != null) result.complete(r)
+            }
+        }
+        launch {
+            jobs.forEach { it.join() }
+            result.complete(null)
+        }
+        val r = result.await()
+        coroutineContext.cancelChildren()
+        r
+    }
+
+    private suspend fun doResolve(embedUrl: String, pageUrl: String?, first: Boolean): Resolved? {
         cached(embedUrl)?.let { return it }
         val base = baseUrl ?: mainUrl
         val origin = originOf(embedUrl)
-        val spoof = pageUrl?.let { runCatching { URL(it).path }.getOrNull() }
 
-        return webViewLock.withLock {
-            val c = cached(embedUrl)
-            if (c != null) return@withLock c
-            // A background warm-up is dropped if the user has moved on to another channel
-            if (embedUrl !in wanted && latestPrewarm != embedUrl) {
-                Log.i(TAG, "prewarm skipped")
-                return@withLock null
-            }
-
-            val attempts = listOf(
-                Attempt("spoof", "$base/api/settings", injectScript(embedUrl, spoof), 11_000L),
-                Attempt("plain", "$base/api/settings", injectScript(embedUrl, null), 9_000L),
-                Attempt("page", pageUrl ?: embedUrl, null, 9_000L),
-            )
-            var hit: Pair<String, Map<String, String>>? = null
-            val log = ArrayList<String>()
-            for (a in attempts) {
-                hit = sniff(a.page, "$base/", a.script, a.ms)
-                if (hit != null) {
-                    log.add("${a.label}:hit")
-                    break
-                }
-                log.add("${a.label}:miss")
-            }
-            Log.i(TAG, "resolve ${spoof ?: embedUrl.takeLast(24)}: ${log.joinToString(" ")}")
-
-            val h = hit ?: return@withLock null
-            val (url, hdrs) = h
-            val r = Resolved(url, hdrs["Referer"] ?: "$origin/", buildHeaders(hdrs, origin), expiryOf(url))
-            linkCache[embedUrl] = r
-            r
+        val attempts = ArrayList<suspend () -> Sniffed?>()
+        // 1) the player inside a tiny page on the site (fast)
+        attempts.add {
+            TimWeb.sniff("$base/api/settings", "$base/", injectScript(embedUrl), USER_AGENT, 12_000L, "iframe")
         }
+        // 2) the real channel page, exactly like a browser (most faithful)
+        if (first && pageUrl != null) {
+            attempts.add { TimWeb.sniff(pageUrl, "$base/", null, USER_AGENT, 16_000L, "page") }
+        }
+        // 3) the player on its own, starting a little later
+        attempts.add {
+            delay(5_000L)
+            TimWeb.sniff(embedUrl, "$base/", autoplayScript, USER_AGENT, 12_000L, "direct")
+        }
+
+        val hit = race(attempts) ?: return null
+        val r = Resolved(
+            hit.url,
+            hit.headers["Referer"] ?: "$origin/",
+            buildHeaders(hit.headers, origin),
+            expiryOf(hit.url)
+        )
+        linkCache[embedUrl] = r
+        return r
     }
 
     /** One shared job per stream: warm-up and Play never do the same work twice. */
-    private fun launchResolve(embedUrl: String, pageUrl: String?, user: Boolean): Deferred<Resolved?> {
+    private fun launchResolve(embedUrl: String, pageUrl: String?, user: Boolean, first: Boolean): Deferred<Resolved?> {
         if (user) wanted.add(embedUrl)
         cached(embedUrl)?.let { return CompletableDeferred(it) }
         inflight[embedUrl]?.let { if (it.isActive) return it }
+        if (!user) {
+            // drop old warm-ups nobody is waiting for
+            inflight.entries.toList().forEach { e ->
+                if (e.key != embedUrl && e.key !in wanted && e.value.isActive) e.value.cancel()
+            }
+        }
         val d = scope.async(start = CoroutineStart.LAZY) {
             try {
-                doResolve(embedUrl, pageUrl)
+                doResolve(embedUrl, pageUrl, first)
             } finally {
                 wanted.remove(embedUrl)
             }
@@ -565,7 +540,7 @@ class TimStreamsProvider : MainAPI() {
         if (streams.isEmpty()) return false
 
         // Start every stream first (in order), then collect results as they arrive
-        val jobs = streams.map { s -> s to launchResolve(s.url!!, ld?.page, true) }
+        val jobs = streams.mapIndexed { i, s -> s to launchResolve(s.url!!, ld?.page, user = true, first = i == 0) }
 
         var found = false
         jobs.amap { (stream, job) ->
