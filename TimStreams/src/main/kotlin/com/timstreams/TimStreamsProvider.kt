@@ -323,7 +323,7 @@ class TimStreamsProvider : MainAPI() {
             compareByDescending<ItemDto> { it.isLive() }.thenBy { it.startMillis() ?: Long.MAX_VALUE }
         )
 
-    // Loads one sports channel in the background so the browser caches the player files.
+    // Loads one sports channel in the background so the player files are warm.
     private fun prime() {
         if (primed) return
         val items = feed[KIND_CHANNELS]?.items ?: return
@@ -331,7 +331,7 @@ class TimStreamsProvider : MainAPI() {
             ?.streams?.firstOrNull { it.vip != true && !it.url.isNullOrBlank() }?.url ?: return
         primed = true
         scope.launch {
-            delay(1_500L)
+            delay(1_200L)
             runCatching { launchResolve(target, null, user = false, first = false) }
         }
     }
@@ -419,6 +419,10 @@ class TimStreamsProvider : MainAPI() {
     // Stream resolving
     // -----------------------------------------------------------------------
     private val expiryRegex = Regex("""/(\d{10})/[^/]+$""")
+    private val pRegex = Regex("""(https?://[^"'\s\\<>]+)?/p/([0-9a-fA-F]{32})""")
+    private val m3u8Any = Regex("""https?://[^"'\s<>\\]+?\.m3u8[^"'\s<>\\]*""")
+    private val signedAny = Regex("""(?:SIGNED_URL|data-signed-url)["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)""")
+
     private val autoplayScript = """
         (function(){
           try {
@@ -463,6 +467,155 @@ class TimStreamsProvider : MainAPI() {
         return if (System.currentTimeMillis() < r.expiresAt) r else null
     }
 
+    // ---- fast path: page -> /p/<token> -> XOR with the token -> playlist -----
+
+    private fun hexBytes(hex: String): ByteArray? = runCatching {
+        ByteArray(hex.length / 2) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+    }.getOrNull()
+
+    private fun keyVariants(token: String): List<ByteArray> {
+        val hex = hexBytes(token)
+        val out = ArrayList<ByteArray>()
+        hex?.let { out.add(it) }
+        out.add(token.toByteArray())
+        hex?.let { out.add(it.reversedArray()) }
+        out.add(token.reversed().toByteArray())
+        return out.filter { it.isNotEmpty() }
+    }
+
+    private fun printable(bytes: ByteArray): String {
+        val sb = StringBuilder()
+        for (b in bytes) {
+            val v = b.toInt() and 0xFF
+            if (v in 0x20..0x7E) sb.append(v.toChar()) else if (sb.isNotEmpty()) break
+        }
+        return sb.toString().trim()
+    }
+
+    private fun isPlaylistUrl(s: String) =
+        s.startsWith("http") && s.contains(".m3u8") && !s.contains(' ') && s.length > 25
+
+    private fun xorDecode(raw: ByteArray, token: String): String? {
+        if (raw.isEmpty()) return null
+        for (key in keyVariants(token)) {
+            val out = ByteArray(raw.size)
+            for (i in raw.indices) out[i] = (raw[i].toInt() xor key[i % key.size].toInt()).toByte()
+            printable(out).let { if (isPlaylistUrl(it)) return it }
+            for (skip in 1..4) {
+                if (skip >= out.size) break
+                printable(out.copyOfRange(skip, out.size)).let { if (isPlaylistUrl(it)) return it }
+            }
+        }
+        return null
+    }
+
+    private fun decodeBody(raw: ByteArray, text: String, token: String): String? {
+        xorDecode(raw, token)?.let { return it }
+        xorDecode(text.toByteArray(Charsets.UTF_8), token)?.let { return it }
+        xorDecode(text.toByteArray(Charsets.ISO_8859_1), token)?.let { return it }
+        runCatching {
+            val b64 = android.util.Base64.decode(text.trim(), android.util.Base64.DEFAULT)
+            xorDecode(b64, token)?.let { return it }
+        }
+        return null
+    }
+
+    private suspend fun resolveFast(embedUrl: String, pageUrl: String?, notes: MutableList<String>): Resolved? {
+        val base = baseUrl ?: mainUrl
+        val referer = pageUrl ?: "$base/"
+        val origin = originOf(embedUrl)
+
+        if (m3u8Any.containsMatchIn(embedUrl)) {
+            return Resolved(embedUrl, "$origin/", buildHeaders(emptyMap(), origin), expiryOf(embedUrl))
+        }
+
+        // the token can already be in the stream url
+        var token: String? = null
+        var pUrl: String? = null
+        pRegex.find(embedUrl)?.let {
+            token = it.groupValues[2]
+            pUrl = "$origin/p/${it.groupValues[2]}"
+        }
+
+        if (token == null) {
+            val page = runCatching {
+                app.get(
+                    embedUrl,
+                    referer = referer,
+                    headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Accept" to "text/html,application/xhtml+xml,*/*",
+                    ),
+                    timeout = 14L
+                )
+            }.getOrNull()
+
+            if (page == null || !page.isSuccessful) {
+                notes.add("http:page${page?.code ?: 0}")
+                return null
+            }
+            val html = page.text.replace("\\/", "/")
+            signedAny.find(html)?.groupValues?.get(1)?.let { direct ->
+                val abs = if (direct.startsWith("//")) "https:$direct" else direct
+                if (isPlaylistUrl(abs)) {
+                    return Resolved(abs, "$origin/", buildHeaders(emptyMap(), origin), expiryOf(abs))
+                }
+            }
+            m3u8Any.find(html)?.value?.let { direct ->
+                if (isPlaylistUrl(direct)) {
+                    return Resolved(direct, "$origin/", buildHeaders(emptyMap(), origin), expiryOf(direct))
+                }
+            }
+            val m = pRegex.find(html)
+            if (m == null) {
+                notes.add("http:no-p")
+                return null
+            }
+            token = m.groupValues[2]
+            pUrl = (m.groupValues[1].takeIf { it.startsWith("http") }?.let { "$it/p/${m.groupValues[2]}" })
+                ?: "$origin/p/${m.groupValues[2]}"
+        }
+
+        val tok = token ?: return null
+        val candidates = LinkedHashSet<String>()
+        pUrl?.let { candidates.add(it) }
+        candidates.add("$origin/p/$tok")
+        runCatching { candidates.add("https://tims-001.sytes.net/p/$tok") }
+
+        for (candidate in candidates) {
+            val res = runCatching {
+                app.get(
+                    candidate,
+                    referer = referer,
+                    headers = mapOf(
+                        "User-Agent" to USER_AGENT,
+                        "Accept" to "*/*",
+                        "Origin" to origin,
+                    ),
+                    timeout = 14L
+                )
+            }.getOrNull() ?: continue
+
+            if (!res.isSuccessful) {
+                notes.add("http:p${res.code}@${Regex("""^https?://([^/]+)""").find(candidate)?.groupValues?.get(1)?.take(12)}")
+                continue
+            }
+            val raw = runCatching { res.body.bytes() }.getOrNull() ?: ByteArray(0)
+            val text = runCatching { res.text }.getOrDefault("")
+            val decoded = decodeBody(raw, text, tok)
+            if (decoded != null) {
+                notes.add("http:ok")
+                val streamOrigin = originOf(decoded)
+                val headers = buildHeaders(mapOf("Origin" to origin, "Referer" to "$origin/"), origin)
+                return Resolved(decoded, "$streamOrigin/", headers, expiryOf(decoded))
+            }
+            notes.add("http:xor-fail len=${if (raw.isNotEmpty()) raw.size else text.length}")
+        }
+        return null
+    }
+
+    // ---- slow path: hidden browser ------------------------------------------
+
     /** Runs several ways of loading the player at the same time; the first link wins. */
     private suspend fun race(attempts: List<suspend () -> Sniffed?>): Sniffed? = coroutineScope {
         val result = CompletableDeferred<Sniffed?>()
@@ -484,26 +637,30 @@ class TimStreamsProvider : MainAPI() {
     private suspend fun doResolve(embedUrl: String, pageUrl: String?, first: Boolean): Resolved? {
         cached(embedUrl)?.let { return it }
         val base = baseUrl ?: mainUrl
-        val origin = originOf(embedUrl)
         val notes = Collections.synchronizedList(ArrayList<String>())
-        val framePage = pageUrl ?: "$base/"
 
-        val attempts = ArrayList<suspend () -> Sniffed?>()
-        // 1) the player inside a tiny page that looks like the site (fast)
-        attempts.add {
-            TimWeb.sniff(framePage, "$base/", frameHtml(embedUrl), null, 22_000L, "frame", notes)
+        // 1) plain HTTP, ~1 second
+        resolveFast(embedUrl, pageUrl, notes)?.let {
+            linkCache[embedUrl] = it
+            return it
         }
-        // 2) the real channel page, exactly like a browser
+
+        // 2) hidden browser, only if the fast path failed
+        val origin = originOf(embedUrl)
+        val framePage = pageUrl ?: "$base/"
+        val attempts = ArrayList<suspend () -> Sniffed?>()
+        attempts.add {
+            TimWeb.sniff(framePage, "$base/", frameHtml(embedUrl), null, 26_000L, "frame", notes)
+        }
         if (first && pageUrl != null) {
             attempts.add {
-                delay(2_500L)
-                TimWeb.sniff(pageUrl, "$base/", null, null, 22_000L, "page", notes)
+                delay(2_000L)
+                TimWeb.sniff(pageUrl, "$base/", null, null, 26_000L, "page", notes)
             }
         }
-        // 3) the player on its own, starting a little later
         attempts.add {
-            delay(4_500L)
-            TimWeb.sniff(embedUrl, "$base/", null, autoplayScript, 20_000L, "direct", notes)
+            delay(3_500L)
+            TimWeb.sniff(embedUrl, "$base/", null, autoplayScript, 24_000L, "direct", notes)
         }
 
         val hit = race(attempts)
@@ -529,7 +686,6 @@ class TimStreamsProvider : MainAPI() {
         cached(embedUrl)?.let { return CompletableDeferred(it) }
         inflight[embedUrl]?.let { if (it.isActive) return it }
         if (!user) {
-            // drop old warm-ups nobody is waiting for
             inflight.entries.toList().forEach { e ->
                 if (e.key != embedUrl && e.key !in wanted && e.value.isActive) e.value.cancel()
             }
@@ -556,7 +712,6 @@ class TimStreamsProvider : MainAPI() {
         val streams = ld?.streams.orEmpty().filter { it.vip != true && !it.url.isNullOrBlank() }
         if (streams.isEmpty()) return false
 
-        // Start every stream first (in order), then collect results as they arrive
         val jobs = streams.mapIndexed { i, s -> s to launchResolve(s.url!!, ld?.page, user = true, first = i == 0) }
 
         var found = false
