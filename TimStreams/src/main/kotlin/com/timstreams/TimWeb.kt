@@ -7,7 +7,10 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -18,21 +21,23 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayInputStream
+import java.util.Collections
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 internal class Sniffed(val url: String, val headers: Map<String, String>)
 
-/** Our own hidden browser: blocks junk, catches the stream playlist request. */
+/** Our own hidden browser: loads the player and catches the stream playlist request. */
 internal object TimWeb {
     private const val TAG = "TimStreams"
 
     @Volatile var context: Context? = null
     private val main = Handler(Looper.getMainLooper())
     private val slots = Semaphore(3)
-
-    private val blockedExt = listOf(".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".woff", ".woff2", ".ttf")
+    private val pRegex = Regex("""/p/[0-9a-f]{32}""")
     private val blockedHosts = listOf(
         "doubleclick", "googlesyndication", "google-analytics", "googletagmanager",
-        "adservice", "histats", "popads", "propeller", "adsterra", "clarity.ms", "yandex"
+        "adservice", "histats", "popads", "propeller", "adsterra", "clarity.ms"
     )
 
     private fun appContext(): Context? {
@@ -49,27 +54,16 @@ internal object TimWeb {
         return path.contains(".m3u8") || path.contains("/main/secure/")
     }
 
-    private fun emptyResponse(mime: String, body: String = ""): WebResourceResponse =
+    private fun emptyResponse(mime: String): WebResourceResponse =
         WebResourceResponse(
             mime, "utf-8", 200, "OK",
             mapOf("Access-Control-Allow-Origin" to "*"),
-            ByteArrayInputStream(body.toByteArray(Charsets.UTF_8))
+            ByteArrayInputStream(ByteArray(0))
         )
 
     private fun blocked(u: String): WebResourceResponse? {
         val l = u.lowercase()
-        val path = l.substringBefore("?")
-        if (path.contains("disable-devtool")) {
-            return emptyResponse(
-                "text/javascript",
-                "window.DisableDevtool=Object.assign(function(){},{isRunning:false,isSuspend:true," +
-                    "version:'0',md5:function(){return ''},isDevToolOpened:function(){return false}," +
-                    "close:function(){}});"
-            )
-        }
-        if (blockedHosts.any { l.contains(it) }) return emptyResponse("text/javascript")
-        if (blockedExt.any { path.endsWith(it) }) return emptyResponse("image/png")
-        return null
+        return if (blockedHosts.any { l.contains(it) }) emptyResponse("text/javascript") else null
     }
 
     private fun sameSite(a: String?, b: String?): Boolean {
@@ -79,13 +73,11 @@ internal object TimWeb {
     }
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun setup(wv: WebView, ua: String) {
+    private fun setup(wv: WebView) {
         val s = wv.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
         s.mediaPlaybackRequiresUserGesture = false
-        s.userAgentString = ua
-        s.loadsImagesAutomatically = false
         s.blockNetworkImage = true
         s.javaScriptCanOpenWindowsAutomatically = false
         s.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
@@ -107,31 +99,42 @@ internal object TimWeb {
         }
     }
 
+    /**
+     * If [html] is given it is shown as a page whose address is [pageUrl] (no network needed);
+     * otherwise [pageUrl] is loaded normally.
+     */
     suspend fun sniff(
         pageUrl: String,
         referer: String?,
+        html: String?,
         script: String?,
-        userAgent: String,
         timeoutMs: Long,
-        tag: String
-    ): Sniffed? = slots.withPermit { sniffInner(pageUrl, referer, script, userAgent, timeoutMs, tag) }
+        tag: String,
+        notes: MutableList<String>
+    ): Sniffed? = slots.withPermit { sniffInner(pageUrl, referer, html, script, timeoutMs, tag, notes) }
 
     private suspend fun sniffInner(
         pageUrl: String,
         referer: String?,
+        html: String?,
         script: String?,
-        userAgent: String,
         timeoutMs: Long,
-        tag: String
+        tag: String,
+        notes: MutableList<String>
     ): Sniffed? {
         val c = appContext()
         if (c == null) {
-            Log.w(TAG, "sniff[$tag]: no context")
+            notes.add("$tag:no-context")
             return null
         }
         val started = System.currentTimeMillis()
         val result = CompletableDeferred<Sniffed?>()
-        val seen = java.util.Collections.synchronizedList(ArrayList<String>())
+        val seen = Collections.synchronizedList(ArrayList<String>())
+        val errs = Collections.synchronizedList(ArrayList<String>())
+        val reqCount = AtomicInteger(0)
+        val finished = AtomicInteger(0)
+        val sawP = AtomicBoolean(false)
+        val sawWasm = AtomicBoolean(false)
         val holder = arrayOfNulls<WebView>(1)
         val topHost = runCatching { Uri.parse(pageUrl).host }.getOrNull()
 
@@ -139,8 +142,17 @@ internal object TimWeb {
             try {
                 val wv = WebView(c)
                 holder[0] = wv
-                setup(wv, userAgent)
-                var scriptDone = false
+                setup(wv)
+
+                wv.webChromeClient = object : WebChromeClient() {
+                    override fun onConsoleMessage(cm: ConsoleMessage?): Boolean {
+                        if (cm != null && cm.messageLevel() == ConsoleMessage.MessageLevel.ERROR && errs.size < 3) {
+                            errs.add("js:" + cm.message().take(50))
+                        }
+                        return true
+                    }
+                }
+
                 wv.webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(
                         view: WebView?,
@@ -148,7 +160,10 @@ internal object TimWeb {
                     ): WebResourceResponse? {
                         val r = request ?: return null
                         val u = r.url.toString()
-                        if (seen.size < 30) seen.add(u.take(120))
+                        reqCount.incrementAndGet()
+                        if (seen.size < 24) seen.add(u.take(110))
+                        if (pRegex.containsMatchIn(u)) sawP.set(true)
+                        if (u.contains("plum.wasm")) sawWasm.set(true)
                         if (isPlaylist(u)) {
                             if (!result.isCompleted) {
                                 result.complete(Sniffed(u, r.requestHeaders ?: emptyMap()))
@@ -158,39 +173,73 @@ internal object TimWeb {
                         return blocked(u)
                     }
 
+                    // Only the top page is protected from ad redirects. Frames (the player) load freely.
                     override fun shouldOverrideUrlLoading(
                         view: WebView?,
                         request: WebResourceRequest?
                     ): Boolean {
-                        val host = request?.url?.host
-                        // never let ads or anti-embed code navigate us away
-                        return !sameSite(host, topHost)
+                        val r = request ?: return false
+                        if (!r.isForMainFrame) return false
+                        return !sameSite(r.url.host, topHost)
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        if (script != null && !scriptDone) {
-                            scriptDone = true
+                        if (finished.incrementAndGet() == 1 && script != null) {
                             view?.evaluateJavascript(script, null)
                         }
                     }
+
+                    override fun onReceivedHttpError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        errorResponse: WebResourceResponse?
+                    ) {
+                        if (request != null && errorResponse != null && errs.size < 3) {
+                            val host = request.url.host?.take(14) ?: "?"
+                            errs.add("${errorResponse.statusCode}@$host")
+                        }
+                    }
+
+                    override fun onReceivedError(
+                        view: WebView?,
+                        request: WebResourceRequest?,
+                        error: WebResourceError?
+                    ) {
+                        if (request != null && error != null && request.isForMainFrame && errs.size < 3) {
+                            errs.add("neterr${error.errorCode}")
+                        }
+                    }
                 }
-                val extra = HashMap<String, String>()
-                if (referer != null) extra["Referer"] = referer
-                wv.loadUrl(pageUrl, extra)
+
+                if (html != null) {
+                    wv.loadDataWithBaseURL(pageUrl, html, "text/html", "utf-8", null)
+                } else {
+                    val extra = HashMap<String, String>()
+                    if (referer != null) extra["Referer"] = referer
+                    wv.loadUrl(pageUrl, extra)
+                }
             } catch (e: Throwable) {
                 Log.w(TAG, "sniff[$tag] webview error: $e")
+                errs.add("webview:" + e.javaClass.simpleName)
                 result.complete(null)
             }
         }
 
         try {
             val r = withTimeoutOrNull(timeoutMs) { result.await() }
-            val ms = System.currentTimeMillis() - started
+            val secs = "%.1f".format((System.currentTimeMillis() - started) / 1000.0)
             if (r != null) {
-                Log.i(TAG, "sniff[$tag] HIT in ${ms}ms ${r.url.take(110)}")
+                notes.add("$tag:HIT ${secs}s")
+                Log.i(TAG, "sniff[$tag] HIT in ${secs}s ${r.url.take(110)}")
             } else {
-                Log.i(TAG, "sniff[$tag] MISS after ${ms}ms, requests seen=${seen.size}")
-                synchronized(seen) { seen.take(25).forEach { Log.i(TAG, "  seen[$tag] $it") } }
+                val e = synchronized(errs) { errs.joinToString(",") }
+                notes.add(
+                    "$tag:miss req=${reqCount.get()} p=${if (sawP.get()) "Y" else "N"} " +
+                        "w=${if (sawWasm.get()) "Y" else "N"} fin=${finished.get()}" +
+                        (if (e.isNotEmpty()) " $e" else "")
+                )
+                Log.i(TAG, "sniff[$tag] MISS after ${secs}s")
+                synchronized(seen) { seen.forEach { Log.i(TAG, "  seen[$tag] $it") } }
             }
             return r
         } finally {
