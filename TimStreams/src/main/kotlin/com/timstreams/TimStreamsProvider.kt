@@ -527,7 +527,6 @@ class TimStreamsProvider : MainAPI() {
 
     // ---- candidate handling ------------------------------------------------
 
-    /** The server only serves the real playlist with the _vN suffix present. */
     private fun withVersion(url: String): String {
         val m = fileTail.find(url.trim()) ?: return url
         val name = m.groupValues[2]
@@ -735,22 +734,17 @@ class TimStreamsProvider : MainAPI() {
         }
 
         val hit = race(attempts)
+        if (hit != null) {
+            accept(hit.url, origin, "web", slug, notes)?.let { fixed ->
+                notesFor[embedUrl] = synchronized(notes) { notes.joinToString(" ") }
+                linkCache[embedUrl] = fixed
+                return fixed
+            }
+        }
         val text = synchronized(notes) { notes.joinToString(" ") }
         notesFor[embedUrl] = text
-        if (hit == null) {
-            Log.w(TAG, "resolve failed: $text")
-            return null
-        }
-        val fixed = withVersion(hit.url)
-        val r = Resolved(
-            fixed,
-            hit.headers["Referer"] ?: "$origin/",
-            buildHeaders(hit.headers, origin),
-            expiryOf(fixed),
-            "web"
-        )
-        linkCache[embedUrl] = r
-        return r
+        Log.w(TAG, "resolve failed: $text")
+        return null
     }
 
     private fun launchResolve(embedUrl: String, pageUrl: String?, user: Boolean, first: Boolean): Deferred<Resolved?> {
@@ -792,7 +786,8 @@ class TimStreamsProvider : MainAPI() {
             val resolved = withTimeoutOrNull(RESOLVE_WAIT) { runCatching { job.await() }.getOrNull() }
             if (resolved != null) {
                 runCatching {
-                    val stage = resolved.stage.ifBlank { "ok" }
+                    val note = notesFor[stream.url!!].orEmpty()
+                    val label = if (debug && note.isNotBlank()) "$shown · $note".take(120) else shown
                     val proxyHeaders = resolved.headers.filterKeys {
                         it.equals("Origin", true) || it.equals("User-Agent", true)
                     }
@@ -801,7 +796,7 @@ class TimStreamsProvider : MainAPI() {
                         callback(
                             newExtractorLink(
                                 source = name,
-                                name = "$shown · $stage",
+                                name = label,
                                 url = proxied,
                                 type = ExtractorLinkType.M3U8
                             ) {
@@ -815,7 +810,7 @@ class TimStreamsProvider : MainAPI() {
                     callback(
                         newExtractorLink(
                             source = name,
-                            name = if (proxied != null) "$shown · Backup" else "$shown · $stage",
+                            name = if (proxied != null) "$shown · Backup" else label,
                             url = resolved.url,
                             type = ExtractorLinkType.M3U8
                         ) {
@@ -825,18 +820,6 @@ class TimStreamsProvider : MainAPI() {
                         }
                     )
                     found = true
-                    if (debug) {
-                        callback(
-                            newExtractorLink(
-                                source = name,
-                                name = "⚠ ${resolved.url.substringAfterLast('/')}".take(190),
-                                url = "https://invalid.invalid/${System.nanoTime()}.m3u8",
-                                type = ExtractorLinkType.M3U8
-                            ) {
-                                this.quality = Qualities.Unknown.value
-                            }
-                        )
-                    }
                 }
             } else {
                 Log.w(TAG, "no link for $shown")
