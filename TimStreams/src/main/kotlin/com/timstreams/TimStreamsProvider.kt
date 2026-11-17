@@ -26,6 +26,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.ConcurrentHashMap
@@ -34,7 +35,7 @@ private const val TAG = "TimStreams"
 private const val CONFIG_URL = "https://raw.githubusercontent.com/YOUR_GITHUB_REPO/main/config.json"
 private val DEFAULT_DOMAINS = listOf("https://tim-streams.com")
 private const val USER_AGENT =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 private const val BASE_TTL = 10 * 60_000L
 private const val ITEMS_TTL = 30_000L
 private const val LINK_TTL_DEFAULT = 90_000L
@@ -122,7 +123,10 @@ class TimStreamsProvider : MainAPI() {
     private val known = ConcurrentHashMap<String, ItemDto>()
     private val linkCache = ConcurrentHashMap<String, Resolved>()
     private val inflight = ConcurrentHashMap<String, Deferred<Resolved?>>()
+    private val notesFor = ConcurrentHashMap<String, String>()
     private val wanted: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    @Volatile private var primed = false
+    @Volatile private var debug = true
     @Volatile private var baseUrl: String? = null
     @Volatile private var baseCheckedAt = 0L
     @Volatile private var eventTz = "America/New_York"
@@ -161,6 +165,7 @@ class TimStreamsProvider : MainAPI() {
 
             val cfg = loadConfig()
             cfg?.eventTimezone?.takeIf { it.isNotBlank() }?.let { eventTz = it }
+            cfg?.debug?.let { debug = it }
 
             val candidates = (listOfNotNull(current) + cfg?.domains.orEmpty() + DEFAULT_DOMAINS)
                 .map { it.trim().trimEnd('/') }
@@ -218,7 +223,7 @@ class TimStreamsProvider : MainAPI() {
         val path = if (kind == KIND_EVENTS) "/api/live-upcoming" else "/api/channels"
         val text = app.get(base + path, headers = apiHeaders(base), timeout = 20L).text
         val items = parseItems(text, kind)
-        Log.i(TAG, "fetch $kind: items=${items?.size} chars=${text.length} head=${text.take(100)}")
+        Log.i(TAG, "fetch $kind: items=${items?.size} chars=${text.length}")
         items
     }.getOrNull()
 
@@ -318,6 +323,19 @@ class TimStreamsProvider : MainAPI() {
             compareByDescending<ItemDto> { it.isLive() }.thenBy { it.startMillis() ?: Long.MAX_VALUE }
         )
 
+    // Loads one sports channel in the background so the browser caches the player files.
+    private fun prime() {
+        if (primed) return
+        val items = feed[KIND_CHANNELS]?.items ?: return
+        val target = items.firstOrNull { it.genre == 2 && !it.streams.isNullOrEmpty() }
+            ?.streams?.firstOrNull { it.vip != true && !it.url.isNullOrBlank() }?.url ?: return
+        primed = true
+        scope.launch {
+            delay(1_500L)
+            runCatching { launchResolve(target, null, user = false, first = false) }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Home, search, details
     // -----------------------------------------------------------------------
@@ -329,6 +347,7 @@ class TimStreamsProvider : MainAPI() {
             val filter = request.data.substringAfter(":")
             val base = resolveBase()
             val all = getItems(kind)
+            if (kind == KIND_CHANNELS) prime()
 
             val picked: List<ItemDto> = when {
                 filter == "live" -> all.filter { it.isLive() }
@@ -411,6 +430,14 @@ class TimStreamsProvider : MainAPI() {
         })();
     """.trimIndent()
 
+    private fun frameHtml(embedUrl: String): String {
+        val src = embedUrl.replace("&", "&amp;").replace("\"", "&quot;")
+        return "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"></head>" +
+            "<body style=\"margin:0;background:#000\"><iframe src=\"$src\" " +
+            "allow=\"autoplay; encrypted-media; fullscreen\" allowfullscreen " +
+            "style=\"border:0;width:100vw;height:100vh\"></iframe></body></html>"
+    }
+
     private fun originOf(url: String): String =
         Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1) ?: url
 
@@ -429,27 +456,6 @@ class TimStreamsProvider : MainAPI() {
             ?: return now + LINK_TTL_DEFAULT
         val exp = ts * 1000L - 5 * 60_000L
         return if (exp > now + 30_000L) minOf(exp, now + LINK_TTL_MAX) else now + LINK_TTL_DEFAULT
-    }
-
-    private fun jsEsc(s: String) = s.replace("\\", "\\\\").replace("'", "\\'")
-
-    private fun injectScript(embedUrl: String): String {
-        val src = jsEsc(embedUrl)
-        return """
-            (function(){
-              try {
-                if (window.__tim) { return; }
-                window.__tim = 1;
-                document.documentElement.innerHTML = '<head></head><body style="margin:0;background:#000"></body>';
-                var f = document.createElement('iframe');
-                f.src = '$src';
-                f.allow = 'autoplay; encrypted-media; fullscreen';
-                f.setAttribute('allowfullscreen', 'true');
-                f.style.cssText = 'border:0;width:100vw;height:100vh';
-                document.body.appendChild(f);
-              } catch (e) {}
-            })();
-        """.trimIndent()
     }
 
     private fun cached(embedUrl: String): Resolved? {
@@ -479,23 +485,34 @@ class TimStreamsProvider : MainAPI() {
         cached(embedUrl)?.let { return it }
         val base = baseUrl ?: mainUrl
         val origin = originOf(embedUrl)
+        val notes = Collections.synchronizedList(ArrayList<String>())
+        val framePage = pageUrl ?: "$base/"
 
         val attempts = ArrayList<suspend () -> Sniffed?>()
-        // 1) the player inside a tiny page on the site (fast)
+        // 1) the player inside a tiny page that looks like the site (fast)
         attempts.add {
-            TimWeb.sniff("$base/api/settings", "$base/", injectScript(embedUrl), USER_AGENT, 12_000L, "iframe")
+            TimWeb.sniff(framePage, "$base/", frameHtml(embedUrl), null, 22_000L, "frame", notes)
         }
-        // 2) the real channel page, exactly like a browser (most faithful)
+        // 2) the real channel page, exactly like a browser
         if (first && pageUrl != null) {
-            attempts.add { TimWeb.sniff(pageUrl, "$base/", null, USER_AGENT, 16_000L, "page") }
+            attempts.add {
+                delay(2_500L)
+                TimWeb.sniff(pageUrl, "$base/", null, null, 22_000L, "page", notes)
+            }
         }
         // 3) the player on its own, starting a little later
         attempts.add {
-            delay(5_000L)
-            TimWeb.sniff(embedUrl, "$base/", autoplayScript, USER_AGENT, 12_000L, "direct")
+            delay(4_500L)
+            TimWeb.sniff(embedUrl, "$base/", null, autoplayScript, 20_000L, "direct", notes)
         }
 
-        val hit = race(attempts) ?: return null
+        val hit = race(attempts)
+        if (hit == null) {
+            val text = synchronized(notes) { notes.joinToString(" | ") }
+            notesFor[embedUrl] = text
+            Log.w(TAG, "resolve failed: $text")
+            return null
+        }
         val r = Resolved(
             hit.url,
             hit.headers["Referer"] ?: "$origin/",
@@ -544,10 +561,10 @@ class TimStreamsProvider : MainAPI() {
 
         var found = false
         jobs.amap { (stream, job) ->
+            val shown = displayName(stream.name, ld?.title)
             val resolved = withTimeoutOrNull(RESOLVE_WAIT) { runCatching { job.await() }.getOrNull() }
             if (resolved != null) {
                 runCatching {
-                    val shown = displayName(stream.name, ld?.title)
                     val proxyHeaders = resolved.headers.filterKeys {
                         it.equals("Origin", true) || it.equals("User-Agent", true)
                     }
@@ -582,7 +599,23 @@ class TimStreamsProvider : MainAPI() {
                     found = true
                 }
             } else {
-                Log.w(TAG, "no link for ${stream.name}")
+                Log.w(TAG, "no link for $shown")
+                if (debug) {
+                    runCatching {
+                        val note = notesFor[stream.url!!] ?: "timeout"
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "⚠ $shown: $note".take(190),
+                                url = "https://invalid.invalid/x.m3u8",
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                        found = true
+                    }
+                }
             }
         }
         return found
