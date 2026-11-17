@@ -41,7 +41,7 @@ private const val ITEMS_TTL = 30_000L
 private const val LINK_TTL_DEFAULT = 90_000L
 private const val LINK_TTL_MAX = 60 * 60_000L
 private const val LIVE_WINDOW = 270 * 60_000L
-private const val RESOLVE_WAIT = 30_000L
+private const val RESOLVE_WAIT = 32_000L
 private const val KIND_EVENTS = "events"
 private const val KIND_CHANNELS = "channels"
 private val KEEP_HEADERS = setOf("origin", "referer", "user-agent", "cookie")
@@ -323,7 +323,6 @@ class TimStreamsProvider : MainAPI() {
             compareByDescending<ItemDto> { it.isLive() }.thenBy { it.startMillis() ?: Long.MAX_VALUE }
         )
 
-    // Loads one sports channel in the background so the player files are warm.
     private fun prime() {
         if (primed) return
         val items = feed[KIND_CHANNELS]?.items ?: return
@@ -399,7 +398,6 @@ class TimStreamsProvider : MainAPI() {
         val segment = if (kind == KIND_EVENTS) "event" else "channel"
         val pageUrl = "$base/$segment/$slug"
 
-        // Start finding the stream right now, so Play is (nearly) instant
         free.firstOrNull()?.url?.let { first ->
             runCatching { launchResolve(first, pageUrl, user = false, first = true) }
         }
@@ -422,6 +420,7 @@ class TimStreamsProvider : MainAPI() {
     private val pRegex = Regex("""(https?://[^"'\s\\<>]+)?/p/([0-9a-fA-F]{32})""")
     private val m3u8Any = Regex("""https?://[^"'\s<>\\]+?\.m3u8[^"'\s<>\\]*""")
     private val signedAny = Regex("""(?:SIGNED_URL|data-signed-url)["']?\s*[:=]\s*["']([^"']+\.m3u8[^"']*)""")
+    private val hostOnly = Regex("""^https?://([^/]+)""")
 
     private val autoplayScript = """
         (function(){
@@ -444,6 +443,9 @@ class TimStreamsProvider : MainAPI() {
 
     private fun originOf(url: String): String =
         Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1) ?: url
+
+    private fun hostOf(url: String): String =
+        hostOnly.find(url)?.groupValues?.get(1)?.take(18) ?: "?"
 
     private fun buildHeaders(captured: Map<String, String>, origin: String): Map<String, String> {
         val h = LinkedHashMap<String, String>()
@@ -520,16 +522,53 @@ class TimStreamsProvider : MainAPI() {
         return null
     }
 
+    /** True only when the URL really answers with a playlist (plain or PNG-wrapped). */
+    private suspend fun verify(url: String, origin: String): Boolean {
+        if (!isPlaylistUrl(url)) return false
+        val res = runCatching {
+            app.get(
+                url,
+                referer = "$origin/",
+                headers = mapOf("Origin" to origin, "User-Agent" to USER_AGENT, "Accept" to "*/*"),
+                timeout = 8L
+            )
+        }.getOrNull() ?: return false
+        if (!res.isSuccessful) return false
+        val bytes = runCatching { res.body.bytes() }.getOrNull()
+            ?: runCatching { res.text.toByteArray(Charsets.ISO_8859_1) }.getOrNull()
+            ?: return false
+        if (bytes.isEmpty()) return false
+        val head = String(bytes, 0, minOf(bytes.size, 512), Charsets.ISO_8859_1)
+        if (head.contains("#EXTM3U")) return true
+        // fake-PNG wrapper: 89 50 4E 47
+        return bytes.size > 8 && (bytes[0].toInt() and 0xFF) == 0x89 &&
+            bytes[1] == 0x50.toByte() && bytes[2] == 0x4E.toByte() && bytes[3] == 0x47.toByte()
+    }
+
+    private suspend fun accept(url: String, origin: String, stage: String, notes: MutableList<String>): Resolved? {
+        if (verify(url, origin)) {
+            notes.add("$stage:ok")
+            val streamOrigin = originOf(url)
+            return Resolved(
+                url,
+                "$streamOrigin/",
+                buildHeaders(mapOf("Origin" to origin, "Referer" to "$origin/"), origin),
+                expiryOf(url)
+            )
+        }
+        notes.add("$stage:bad@${hostOf(url)}")
+        return null
+    }
+
     private suspend fun resolveFast(embedUrl: String, pageUrl: String?, notes: MutableList<String>): Resolved? {
         val base = baseUrl ?: mainUrl
         val referer = pageUrl ?: "$base/"
         val origin = originOf(embedUrl)
 
         if (m3u8Any.containsMatchIn(embedUrl)) {
-            return Resolved(embedUrl, "$origin/", buildHeaders(emptyMap(), origin), expiryOf(embedUrl))
+            accept(embedUrl, origin, "self", notes)?.let { return it }
         }
 
-        // the token can already be in the stream url
         var token: String? = null
         var pUrl: String? = null
         pRegex.find(embedUrl)?.let {
@@ -537,6 +576,7 @@ class TimStreamsProvider : MainAPI() {
             pUrl = "$origin/p/${it.groupValues[2]}"
         }
 
+        var html: String? = null
         if (token == null) {
             val page = runCatching {
                 app.get(
@@ -554,69 +594,62 @@ class TimStreamsProvider : MainAPI() {
                 notes.add("http:page${page?.code ?: 0}")
                 return null
             }
-            val html = page.text.replace("\\/", "/")
+            html = page.text.replace("\\/", "/")
+
             signedAny.find(html)?.groupValues?.get(1)?.let { direct ->
                 val abs = if (direct.startsWith("//")) "https:$direct" else direct
-                if (isPlaylistUrl(abs)) {
-                    return Resolved(abs, "$origin/", buildHeaders(emptyMap(), origin), expiryOf(abs))
-                }
+                accept(abs, origin, "signed", notes)?.let { return it }
             }
-            m3u8Any.find(html)?.value?.let { direct ->
-                if (isPlaylistUrl(direct)) {
-                    return Resolved(direct, "$origin/", buildHeaders(emptyMap(), origin), expiryOf(direct))
-                }
+            pRegex.find(html)?.let { m ->
+                token = m.groupValues[2]
+                pUrl = m.groupValues[1].takeIf { it.startsWith("http") }?.let { "$it/p/${m.groupValues[2]}" }
+                    ?: "$origin/p/${m.groupValues[2]}"
             }
-            val m = pRegex.find(html)
-            if (m == null) {
-                notes.add("http:no-p")
-                return null
-            }
-            token = m.groupValues[2]
-            pUrl = (m.groupValues[1].takeIf { it.startsWith("http") }?.let { "$it/p/${m.groupValues[2]}" })
-                ?: "$origin/p/${m.groupValues[2]}"
         }
 
-        val tok = token ?: return null
-        val candidates = LinkedHashSet<String>()
-        pUrl?.let { candidates.add(it) }
-        candidates.add("$origin/p/$tok")
-        runCatching { candidates.add("https://tims-001.sytes.net/p/$tok") }
+        val tok = token
+        if (tok != null) {
+            val candidates = LinkedHashSet<String>()
+            pUrl?.let { candidates.add(it) }
+            candidates.add("$origin/p/$tok")
+            runCatching { candidates.add("https://tims-001.sytes.net/p/$tok") }
 
-        for (candidate in candidates) {
-            val res = runCatching {
-                app.get(
-                    candidate,
-                    referer = referer,
-                    headers = mapOf(
-                        "User-Agent" to USER_AGENT,
-                        "Accept" to "*/*",
-                        "Origin" to origin,
-                    ),
-                    timeout = 14L
-                )
-            }.getOrNull() ?: continue
+            for (candidate in candidates) {
+                val res = runCatching {
+                    app.get(
+                        candidate,
+                        referer = referer,
+                        headers = mapOf("User-Agent" to USER_AGENT, "Accept" to "*/*", "Origin" to origin),
+                        timeout = 14L
+                    )
+                }.getOrNull() ?: continue
 
-            if (!res.isSuccessful) {
-                notes.add("http:p${res.code}@${Regex("""^https?://([^/]+)""").find(candidate)?.groupValues?.get(1)?.take(12)}")
-                continue
+                if (!res.isSuccessful) {
+                    notes.add("http:p${res.code}@${hostOf(candidate)}")
+                    continue
+                }
+                val raw = runCatching { res.body.bytes() }.getOrNull() ?: ByteArray(0)
+                val text = runCatching { res.text }.getOrDefault("")
+                val decoded = decodeBody(raw, text, tok)
+                if (decoded == null) {
+                    notes.add("http:xor-fail len=${if (raw.isNotEmpty()) raw.size else text.length}")
+                    continue
+                }
+                accept(decoded, origin, "p", notes)?.let { return it }
             }
-            val raw = runCatching { res.body.bytes() }.getOrNull() ?: ByteArray(0)
-            val text = runCatching { res.text }.getOrDefault("")
-            val decoded = decodeBody(raw, text, tok)
-            if (decoded != null) {
-                notes.add("http:ok")
-                val streamOrigin = originOf(decoded)
-                val headers = buildHeaders(mapOf("Origin" to origin, "Referer" to "$origin/"), origin)
-                return Resolved(decoded, "$streamOrigin/", headers, expiryOf(decoded))
+        }
+
+        // last resort: any playlist string sitting in the page
+        html?.let { h ->
+            m3u8Any.findAll(h).map { it.value }.distinct().take(4).forEach { direct ->
+                runCatching { accept(direct, origin, "scan", notes) }.getOrNull()?.let { return it }
             }
-            notes.add("http:xor-fail len=${if (raw.isNotEmpty()) raw.size else text.length}")
         }
         return null
     }
 
     // ---- slow path: hidden browser ------------------------------------------
 
-    /** Runs several ways of loading the player at the same time; the first link wins. */
     private suspend fun race(attempts: List<suspend () -> Sniffed?>): Sniffed? = coroutineScope {
         val result = CompletableDeferred<Sniffed?>()
         val jobs = attempts.map { a ->
@@ -639,13 +672,12 @@ class TimStreamsProvider : MainAPI() {
         val base = baseUrl ?: mainUrl
         val notes = Collections.synchronizedList(ArrayList<String>())
 
-        // 1) plain HTTP, ~1 second
         resolveFast(embedUrl, pageUrl, notes)?.let {
+            notesFor[embedUrl] = synchronized(notes) { notes.joinToString(" ") }
             linkCache[embedUrl] = it
             return it
         }
 
-        // 2) hidden browser, only if the fast path failed
         val origin = originOf(embedUrl)
         val framePage = pageUrl ?: "$base/"
         val attempts = ArrayList<suspend () -> Sniffed?>()
@@ -664,9 +696,9 @@ class TimStreamsProvider : MainAPI() {
         }
 
         val hit = race(attempts)
+        val text = synchronized(notes) { notes.joinToString(" ") }
+        notesFor[embedUrl] = text
         if (hit == null) {
-            val text = synchronized(notes) { notes.joinToString(" | ") }
-            notesFor[embedUrl] = text
             Log.w(TAG, "resolve failed: $text")
             return null
         }
@@ -680,7 +712,6 @@ class TimStreamsProvider : MainAPI() {
         return r
     }
 
-    /** One shared job per stream: warm-up and Play never do the same work twice. */
     private fun launchResolve(embedUrl: String, pageUrl: String?, user: Boolean, first: Boolean): Deferred<Resolved?> {
         if (user) wanted.add(embedUrl)
         cached(embedUrl)?.let { return CompletableDeferred(it) }
@@ -752,6 +783,19 @@ class TimStreamsProvider : MainAPI() {
                         }
                     )
                     found = true
+                    if (debug) {
+                        val note = notesFor[stream.url!!] ?: "ok"
+                        callback(
+                            newExtractorLink(
+                                source = name,
+                                name = "⚠ ${resolved.url.substringAfterLast('/')} · $note".take(190),
+                                url = "https://invalid.invalid/x.m3u8",
+                                type = ExtractorLinkType.M3U8
+                            ) {
+                                this.quality = Qualities.Unknown.value
+                            }
+                        )
+                    }
                 }
             } else {
                 Log.w(TAG, "no link for $shown")
